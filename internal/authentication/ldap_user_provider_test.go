@@ -7477,3 +7477,138 @@ func NewRootDSESearchRequest(mockClient *MockLDAPClient, err any) *gomock.Call {
 
 	return mockClient.EXPECT().Search(request).Return(result, err)
 }
+
+// TestLDAPUserProviderChangePasswordPooledFactory verifies the ChangePassword
+// user-bound modification works through the pooled client factory, where the
+// service connection comes from the pool and the user-bound connection is
+// dialed unpooled.
+func TestLDAPUserProviderChangePasswordPooledFactory(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+	mockClient := NewMockLDAPClient(ctrl)
+
+	config := &schema.AuthenticationBackendLDAP{
+		Address:  testLDAPAddress,
+		User:     "cn=admin,dc=example,dc=com",
+		Password: "password",
+		Pooling:  schema.AuthenticationBackendLDAPPooling{Enable: true, Count: 5},
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "(uid={input})",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	// Pooled service client dial.
+	mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).
+		Return(mockClient, nil).Times(2)
+
+	mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0)).Times(2)
+
+	NewRootDSESearchRequest(mockClient, nil).Times(2)
+
+	mockClient.EXPECT().Bind("cn=admin,dc=example,dc=com", "password").
+		Return(nil)
+
+	mockClient.EXPECT().Search(gomock.Any()).
+		Return(&ldap.SearchResult{
+			Entries: []*ldap.Entry{
+				{
+					DN: "uid=john,ou=users,dc=example,dc=com",
+					Attributes: []*ldap.EntryAttribute{
+						{Name: "uid", Values: []string{"john"}},
+					},
+				},
+			},
+		}, nil)
+
+	// Unpooled user-bound client bind.
+	mockClient.EXPECT().Bind("uid=john,ou=users,dc=example,dc=com", "oldpass").
+		Return(nil)
+
+	// Exactly one modification over the user-bound connection.
+	mockClient.EXPECT().PasswordModify(gomock.Any()).
+		Return(&ldap.PasswordModifyResult{}, nil)
+
+	// Both the user-bound unpooled client and the service client are
+	// closed on release (the service client is dialed via the pool's
+	// extra-connection path for this single-shot operation).
+	mockClient.EXPECT().Close().Times(2)
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewPooledLDAPClientFactory(config, nil, mockDialer))
+
+	assert.NoError(t, provider.ChangePassword("john", "oldpass", "newpass"))
+}
+
+// TestLDAPUserProviderChangePasswordActiveDirectoryFallback verifies that for
+// the Active Directory implementation, a user-bound password modification
+// which is refused (bare unicodePwd replace is rejected for self-service on
+// AD) falls back to the service client, preserving the previous behaviour.
+func TestLDAPUserProviderChangePasswordActiveDirectoryFallback(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockDialer := NewMockLDAPClientDialer(ctrl)
+	mockClient := NewMockLDAPClient(ctrl)
+
+	config := &schema.AuthenticationBackendLDAP{
+		Implementation: schema.LDAPImplementationActiveDirectory,
+		Address:        testLDAPAddress,
+		User:           "cn=admin,dc=example,dc=com",
+		Password:       "password",
+		Attributes: schema.AuthenticationBackendLDAPAttributes{
+			Username:    "uid",
+			Mail:        "mail",
+			DisplayName: "displayName",
+			MemberOf:    "memberOf",
+		},
+		UsersFilter:       "(uid={input})",
+		AdditionalUsersDN: "ou=users",
+		BaseDN:            "dc=example,dc=com",
+	}
+
+	mockDialer.EXPECT().DialURL("ldap://127.0.0.1:389", gomock.Any()).
+		Return(mockClient, nil).Times(2)
+
+	mockClient.EXPECT().SetTimeout(gomock.Eq(time.Second * 0)).Times(2)
+
+	NewRootDSESearchRequest(mockClient, nil).Times(2)
+
+	mockClient.EXPECT().Bind("cn=admin,dc=example,dc=com", "password").
+		Return(nil)
+
+	mockClient.EXPECT().Search(gomock.Any()).
+		Return(&ldap.SearchResult{
+			Entries: []*ldap.Entry{
+				{
+					DN: "uid=john,ou=users,dc=example,dc=com",
+					Attributes: []*ldap.EntryAttribute{
+						{Name: "uid", Values: []string{"john"}},
+					},
+				},
+			},
+		}, nil)
+
+	mockClient.EXPECT().Bind("uid=john,ou=users,dc=example,dc=com", "oldpass").
+		Return(nil)
+
+	// The user-bound modification is refused by the directory.
+	mockClient.EXPECT().ModifyWithResult(gomock.Any()).
+		Return(nil, ldap.NewError(ldap.LDAPResultConstraintViolation, errors.New("0000052D: Constraint violation")))
+
+	// The service client fallback succeeds.
+	mockClient.EXPECT().ModifyWithResult(gomock.Any()).
+		Return(&ldap.ModifyResult{}, nil)
+
+	mockClient.EXPECT().Close().Times(2)
+
+	provider := NewLDAPUserProviderWithFactory(config, false, NewStandardLDAPClientFactory(config, nil, mockDialer))
+
+	assert.NoError(t, provider.ChangePassword("john", "oldpass", "newpass"))
+}
